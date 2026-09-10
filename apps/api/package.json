@@ -10,7 +10,8 @@
     "ingest": "tsx src/ingest/ingest.ts",
     "test:chunking": "tsx src/scripts/testChunking.ts",
     "test:embeddings": "tsx src/scripts/testEmbeddings.ts",
-    "test:retrieval": "tsx src/scripts/testRetrieval.ts"
+    "test:retrieval": "tsx src/scripts/testRetrieval.ts",
+    "test:tools": "tsx src/scripts/testTools.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
