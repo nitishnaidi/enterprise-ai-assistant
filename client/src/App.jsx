@@ -14,10 +14,15 @@ export default function App() {
     setLoading(true);
 
     try {
+      const history = messages.map((m) => ({
+        role: m.role === "user" ? "user" : "assistant",
+        content: m.text,
+      }));
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, history }),
       });
       const data = await res.json();
       const reply = res.ok ? data.reply : `Error: ${data.error}`;
