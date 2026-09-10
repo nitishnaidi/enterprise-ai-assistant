@@ -1,7 +1,19 @@
 import { useState } from "react";
 
+interface ChatMessage {
+  role: "user" | "assistant";
+  text: string;
+  sources?: string[];
+}
+
+interface ChatResponse {
+  reply: string;
+  sources?: string[];
+  error?: string;
+}
+
 export default function App() {
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -24,9 +36,12 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, history }),
       });
-      const data = await res.json();
+      const data: ChatResponse = await res.json();
       const reply = res.ok ? data.reply : `Error: ${data.error}`;
-      setMessages((prev) => [...prev, { role: "assistant", text: reply }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text: reply, sources: data.sources },
+      ]);
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -37,7 +52,7 @@ export default function App() {
     }
   };
 
-  const handleKeyDown = (e) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") sendMessage();
   };
 
@@ -49,6 +64,9 @@ export default function App() {
           <div key={i} className={`message ${msg.role}`}>
             <span className="label">{msg.role === "user" ? "You" : "Assistant"}</span>
             <p>{msg.text}</p>
+            {msg.sources && msg.sources.length > 0 && (
+              <p className="sources">Sources: {msg.sources.join(", ")}</p>
+            )}
           </div>
         ))}
         {loading && <div className="message assistant">Thinking...</div>}
