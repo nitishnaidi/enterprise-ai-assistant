@@ -1,3 +1,5 @@
 node_modules
 dist
 .env
+*.tsbuildinfo
+apps/web/vite.config.d.ts
