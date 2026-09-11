@@ -6,6 +6,35 @@ import { log } from "../utils/logger.js";
 const MAX_ITERATIONS = 4;
 const TOOL_TIMEOUT_MS = 5000;
 
+// Not a business tool - this is how Claude talks to the user at all. Plain
+// text output is never accepted (tool_choice: "any" below forbids it), so
+// every reply, including a clarifying question or a write-confirmation
+// prompt, has to come with a structured, self-reported sourcesUsed list. The
+// backend still doesn't trust that list blindly - see the sanitization in
+// index.ts - but it's far more precise than guessing from what was merely
+// retrieved or callable.
+const RESPOND_TOOL: Anthropic.Tool = {
+  name: "respond",
+  description:
+    'Give your final answer to the user. This is the ONLY way to communicate with the user - never output plain text instead of calling this.',
+  input_schema: {
+    type: "object",
+    properties: {
+      reply: {
+        type: "string",
+        description: "The natural-language answer to show the user, in a normal conversational tone.",
+      },
+      sourcesUsed: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          'Every source this reply materially depends on: Context document filenames (e.g. "returns-policy.txt") you actually used, and/or tool names (e.g. "getOrder") whose results you used. Do not list a document or tool that was available but that you did not end up relying on. Use an empty array if the reply does not depend on any specific document or tool result (e.g. a greeting or a clarifying question).',
+      },
+    },
+    required: ["reply", "sourcesUsed"],
+  },
+};
+
 export interface PendingAction {
   tool: string;
   args: unknown;
@@ -14,6 +43,7 @@ export interface PendingAction {
 
 export interface AgentLoopResult {
   finalText: string;
+  sources: string[];
   iterations: number;
   pendingAction?: PendingAction;
 }
@@ -25,16 +55,8 @@ interface RunAgentLoopOptions {
   messages: Anthropic.MessageParam[];
 }
 
-function isTextBlock(block: Anthropic.ContentBlock): block is Anthropic.TextBlock {
-  return block.type === "text";
-}
-
 function isToolUseBlock(block: Anthropic.ContentBlock): block is Anthropic.ToolUseBlock {
   return block.type === "tool_use";
-}
-
-function textOf(content: Anthropic.ContentBlock[]): string {
-  return content.filter(isTextBlock).map((b) => b.text).join("");
 }
 
 function toolResultBlock(toolUseId: string, content: unknown, isError = false): Anthropic.ToolResultBlockParam {
@@ -62,15 +84,17 @@ function describePendingAction(name: string, args: any): string {
 }
 
 // The manual agent loop: send messages + tool definitions to Claude, inspect
-// the response, and either return text or execute a requested tool and loop
-// again. Claude only ever *names* a tool and *proposes* arguments - this
-// function is the only place those proposals turn into real execution, and
-// it enforces the read/write trust boundary before that happens.
+// the response, and either execute a requested business tool and loop again,
+// or - once Claude calls "respond" - return its structured final answer.
+// Claude only ever *names* a tool and *proposes* arguments; this function is
+// the only place those proposals turn into real execution, and it enforces
+// the read/write trust boundary before that happens.
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
   const { anthropic, model, system } = options;
   const messages: Anthropic.MessageParam[] = [...options.messages];
-  const tools = toAnthropicTools();
+  const tools = [...toAnthropicTools(), RESPOND_TOOL];
   const seenCalls = new Set<string>();
+  let pendingAction: PendingAction | undefined;
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     log("iteration:start", { iteration });
@@ -80,21 +104,37 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       max_tokens: 1024,
       system,
       tools,
+      tool_choice: { type: "any" },
       messages,
     });
 
     const toolUseBlocks = response.content.filter(isToolUseBlock);
+    const respondBlock = toolUseBlocks.find((b) => b.name === RESPOND_TOOL.name);
+
+    if (respondBlock) {
+      const input = respondBlock.input as { reply?: unknown; sourcesUsed?: unknown };
+      const reply = typeof input.reply === "string" ? input.reply : pendingAction?.summary ?? "";
+      const sourcesUsed = Array.isArray(input.sourcesUsed)
+        ? input.sourcesUsed.filter((s): s is string => typeof s === "string")
+        : [];
+      log("agent:respond", { iteration, sourcesUsed });
+      return { finalText: reply, sources: sourcesUsed, iterations: iteration, pendingAction };
+    }
 
     if (toolUseBlocks.length === 0) {
-      const finalText = textOf(response.content);
-      log("iteration:final_text", { iteration, length: finalText.length });
-      return { finalText, iterations: iteration };
+      // Shouldn't happen with tool_choice: "any", but fail closed rather than crash.
+      log("agent:no_tool_use_returned", { iteration });
+      return {
+        finalText: "Sorry, I wasn't able to generate a response. Please try again.",
+        sources: [],
+        iterations: iteration,
+        pendingAction,
+      };
     }
 
     messages.push({ role: "assistant", content: response.content });
 
     const resultBlocks: Anthropic.ToolResultBlockParam[] = [];
-    let pendingAction: PendingAction | undefined;
 
     for (const block of toolUseBlocks) {
       const callKey = `${block.name}:${JSON.stringify(block.input)}`;
@@ -133,7 +173,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
         resultBlocks.push(
           toolResultBlock(block.id, {
             status: "awaiting_confirmation",
-            message: "This is a write operation. Do not call it again. Ask the user to explicitly confirm, then stop - do not call any more tools this turn.",
+            message: "This is a write operation. Do not call it again. Call respond to ask the user to explicitly confirm - do not call any more business tools this turn.",
           })
         );
         continue;
@@ -152,21 +192,13 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
     }
 
     messages.push({ role: "user", content: resultBlocks });
-
-    if (pendingAction) {
-      // One more call so Claude can phrase the confirmation question in its
-      // own words - but whatever it says, we never process further tool_use
-      // blocks from this response, so it cannot execute the write tool here
-      // even if it tries again.
-      const followUp = await anthropic.messages.create({ model, max_tokens: 1024, system, tools, messages });
-      const followUpText = textOf(followUp.content);
-      return { finalText: followUpText || pendingAction.summary, iterations: iteration, pendingAction };
-    }
   }
 
   log("iterations:max_reached", { maxIterations: MAX_ITERATIONS });
   return {
     finalText: "I wasn't able to finish handling this within the allowed number of steps. Could you simplify or rephrase your question?",
+    sources: [],
     iterations: MAX_ITERATIONS,
+    pendingAction,
   };
 }

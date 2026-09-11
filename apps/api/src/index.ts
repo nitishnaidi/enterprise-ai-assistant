@@ -5,7 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { embeddingProvider } from "./services/embeddings.js";
 import { searchSimilarChunks } from "./services/retrieval.js";
 import { runAgentLoop } from "./agent/agentLoop.js";
-import { getTool } from "./tools/registry.js";
+import { getTool, getAllTools } from "./tools/registry.js";
 import { log } from "./utils/logger.js";
 
 interface ChatHistoryMessage {
@@ -35,14 +35,17 @@ Rules for using Context:
 - If the context does not contain enough information to answer, say so clearly instead of guessing (e.g. "I don't have enough information in the provided documents to answer that.").
 - If the question is ambiguous or could reasonably be read more than one way, do not silently pick one reading and answer as if it were the only one. State which reading(s) you're addressing, and if the context only covers some of them, say so explicitly instead of extending a clause to a situation it doesn't actually describe.
 - Only apply a specific clause, condition, or exception from the context when the question genuinely matches what it describes. A superficially similar wording is not a match - if you're stretching the context to cover the question, say that the exact scenario isn't addressed rather than presenting an inferred answer as certain.
-- When you do answer from the context, name the source document(s) that support your answer.
 
 Rules for using tools:
 - Only call a tool when you have all the information it requires. If a required argument (like an order ID) is missing from the conversation, ask the user for it instead of guessing or calling the tool with an incomplete or made-up value.
 - Never fabricate a tool result. Only use data that a tool actually returned.
 - If a tool reports the order/item wasn't found, or that it failed, tell the user plainly rather than inventing an answer.
-- Tools that create or change something (like creating a support ticket) are real actions and require confirmation before they run. To request one, call the tool once with the arguments you intend to use - the system will intercept it, hold it for confirmation, and ask the user to confirm on your behalf. Do not instead write the confirmation question yourself without calling the tool. Do not call that tool again until the user has explicitly agreed in a later message.
-- If a request needs an action you have no tool for, say so rather than attempting it another way.`;
+- Tools that create or change something (like creating a support ticket) are real actions and require confirmation before they run. To request one, call the tool once with the arguments you intend to use - the system will intercept it, hold it for confirmation, and ask you to have the user confirm. Do not call that tool again until the user has explicitly agreed in a later message.
+- If a request needs an action you have no tool for, say so rather than attempting it another way.
+
+How to respond:
+- You must always finish by calling the "respond" tool - it is the only way to communicate with the user. Never rely on plain text.
+- In "sourcesUsed", list only the Context document filenames and/or tool names your reply actually relies on. Leave out anything that was available but that you didn't end up using. Use an empty array for replies that don't depend on a specific document or tool result (greetings, clarifying questions, refusals).`;
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.warn(
@@ -123,7 +126,18 @@ app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Respons
     });
     log("chat:response", { iterations: result.iterations, hasPendingAction: Boolean(result.pendingAction) });
 
-    const sources = [...new Set(retrievedChunks.map((chunk) => chunk.documentName))];
+    // Claude self-reports sourcesUsed, but we still don't trust it blindly:
+    // only names that were actually retrieved as context or are real
+    // registered tools can appear here. This is what stops it from claiming
+    // a document/tool it didn't really rely on - or one that doesn't exist.
+    const retrievableNames = new Set([
+      ...retrievedChunks.map((chunk) => chunk.documentName),
+      ...getAllTools().map((tool) => tool.name),
+    ]);
+    const sources = [...new Set(result.sources.filter((name) => retrievableNames.has(name)))];
+    if (sources.length !== result.sources.length) {
+      log("chat:sources_filtered", { claimed: result.sources, kept: sources });
+    }
 
     res.json({ reply: result.finalText, sources, pendingAction: result.pendingAction });
   } catch (err) {
