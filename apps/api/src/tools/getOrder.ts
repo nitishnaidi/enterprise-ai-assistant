@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "./types.js";
-import { mockOrders } from "./mockData.js";
+import { fetchOrder } from "../services/orderServiceClient.js";
 
 interface GetOrderArgs {
   orderId: string;
@@ -31,10 +31,13 @@ export const getOrderTool: ToolDefinition<GetOrderArgs> = {
     return { valid: true, value: { orderId: orderId.trim() } };
   },
   async handler({ orderId }) {
-    const order = mockOrders[orderId];
-    if (!order) {
-      return { success: false, error: `No order found with ID "${orderId}".` };
+    const result = await fetchOrder(orderId);
+    if (!result.ok) {
+      if (result.status === 404) {
+        return { success: false, error: `No order found with ID "${orderId}".` };
+      }
+      return { success: false, error: "Could not retrieve order details right now. Please try again shortly." };
     }
-    return { success: true, data: order };
+    return { success: true, data: result.data };
   },
 };

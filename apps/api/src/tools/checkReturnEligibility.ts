@@ -1,12 +1,5 @@
 import type { ToolDefinition } from "./types.js";
-import { mockOrders } from "./mockData.js";
-
-// Mirrors sample-docs/returns-policy.txt sections 1 and 2. Hardcoded here
-// (rather than re-running RAG from inside a tool) so this tool is a small,
-// deterministic, independently testable business rule - the same shape a
-// real "returns eligibility" microservice would have.
-const RETURN_WINDOW_DAYS = 30;
-const NON_RETURNABLE_CATEGORIES = new Set(["gift_card"]);
+import { fetchReturnEligibility } from "../services/orderServiceClient.js";
 
 interface CheckReturnEligibilityArgs {
   orderId: string;
@@ -42,45 +35,20 @@ export const checkReturnEligibilityTool: ToolDefinition<CheckReturnEligibilityAr
     }
     return { valid: true, value: { orderId: orderId.trim(), itemId: itemId ? (itemId as string).trim() : undefined } };
   },
+  // The 30-day window / non-returnable-category rule itself now lives once,
+  // in order-service - this tool just relays the result. No business logic
+  // is duplicated here anymore.
   async handler({ orderId, itemId }) {
-    const order = mockOrders[orderId];
-    if (!order) {
-      return { success: false, error: `No order found with ID "${orderId}".` };
-    }
-    if (order.status !== "delivered") {
-      return {
-        success: true,
-        data: { eligible: false, reason: `Order status is "${order.status}"; the return window only starts once an order is delivered.` },
-      };
-    }
-
-    const items = itemId ? order.items.filter((item) => item.itemId === itemId) : order.items;
-    if (itemId && items.length === 0) {
-      return { success: false, error: `Item "${itemId}" was not found on order "${orderId}".` };
-    }
-
-    const daysSinceDelivery = Math.floor(
-      (Date.now() - new Date(order.deliveryDate).getTime()) / (1000 * 60 * 60 * 24)
-    );
-    const withinWindow = daysSinceDelivery <= RETURN_WINDOW_DAYS;
-
-    const results = items.map((item) => {
-      const nonReturnableCategory = NON_RETURNABLE_CATEGORIES.has(item.category);
-      const eligible = withinWindow && !nonReturnableCategory;
-      let reason: string;
-      if (nonReturnableCategory) {
-        reason = `${item.name} is in a non-returnable category (${item.category}).`;
-      } else if (!withinWindow) {
-        reason = `Delivered ${daysSinceDelivery} days ago, which is outside the ${RETURN_WINDOW_DAYS}-day return window.`;
-      } else {
-        reason = `Delivered ${daysSinceDelivery} days ago, within the ${RETURN_WINDOW_DAYS}-day return window.`;
+    const result = await fetchReturnEligibility(orderId, itemId);
+    if (!result.ok) {
+      if (result.status === 404) {
+        return {
+          success: false,
+          error: itemId ? `Item "${itemId}" was not found on order "${orderId}".` : `No order found with ID "${orderId}".`,
+        };
       }
-      return { itemId: item.itemId, name: item.name, eligible, reason };
-    });
-
-    return {
-      success: true,
-      data: { orderId, daysSinceDelivery, returnWindowDays: RETURN_WINDOW_DAYS, items: results },
-    };
+      return { success: false, error: "Could not check return eligibility right now. Please try again shortly." };
+    }
+    return { success: true, data: result.data };
   },
 };
