@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { getTool, toAnthropicTools } from "../tools/registry.js";
-import type { ToolResult } from "../tools/types.js";
+import type { ToolDefinition, ToolResult } from "../tools/types.js";
 import { log } from "../utils/logger.js";
 import { withTimeout } from "../utils/timeout.js";
 
@@ -54,6 +54,8 @@ interface RunAgentLoopOptions {
   model: string;
   system: string;
   messages: Anthropic.MessageParam[];
+  /** Fires with the growing "reply" text as Claude streams the final `respond` call, for UI streaming. */
+  onReplyDelta?: (partialReply: string) => void;
 }
 
 function isToolUseBlock(block: Anthropic.ContentBlock): block is Anthropic.ToolUseBlock {
@@ -84,23 +86,54 @@ function describePendingAction(name: string, args: any): string {
 // the only place those proposals turn into real execution, and it enforces
 // the read/write trust boundary before that happens.
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
-  const { anthropic, model, system } = options;
+  const { anthropic, model, system, onReplyDelta } = options;
   const messages: Anthropic.MessageParam[] = [...options.messages];
-  const tools = [...toAnthropicTools(), RESPOND_TOOL];
+  const rawTools = [...toAnthropicTools(), RESPOND_TOOL];
+  // The tool definitions and system prompt are identical on every call this
+  // process makes - only `messages` varies. Marking the end of the tools
+  // list as a cache breakpoint lets Anthropic skip re-processing that whole
+  // static prefix on every iteration of this loop, and on every other chat
+  // turn/user, instead of just the (much smaller) growing conversation.
+  const tools: Anthropic.Tool[] = rawTools.map((tool, i) =>
+    i === rawTools.length - 1 ? { ...tool, cache_control: { type: "ephemeral" } } : tool
+  );
   const seenCalls = new Set<string>();
   let pendingAction: PendingAction | undefined;
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     log("iteration:start", { iteration });
 
-    const response = await anthropic.messages.create({
+    // Only the "respond" tool's input is ever meant to reach the user, so we
+    // track which tool_use block is currently streaming and only forward its
+    // partial "reply" field - a business tool's raw arguments never leak out
+    // as a stream of characters.
+    let activeToolName: string | null = null;
+    const stream = anthropic.messages.stream({
       model,
       max_tokens: 1024,
-      system,
+      system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
       tools,
       tool_choice: { type: "any" },
       messages,
     });
+
+    stream.on("streamEvent", (event) => {
+      if (event.type === "content_block_start" && event.content_block.type === "tool_use") {
+        activeToolName = event.content_block.name;
+      }
+    });
+
+    if (onReplyDelta) {
+      stream.on("inputJson", (_partialJson, jsonSnapshot) => {
+        if (activeToolName !== RESPOND_TOOL.name) return;
+        const partial = jsonSnapshot as { reply?: unknown };
+        if (typeof partial.reply === "string") {
+          onReplyDelta(partial.reply);
+        }
+      });
+    }
+
+    const response = await stream.finalMessage();
 
     const toolUseBlocks = response.content.filter(isToolUseBlock);
     const respondBlock = toolUseBlocks.find((b) => b.name === RESPOND_TOOL.name);
@@ -128,32 +161,42 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 
     messages.push({ role: "assistant", content: response.content });
 
-    const resultBlocks: Anthropic.ToolResultBlockParam[] = [];
+    // Two passes: first classify every requested call synchronously (unknown
+    // tool, bad args, duplicate-in-turn, write-gating) so `seenCalls` and
+    // `pendingAction` are updated deterministically and in order; then run
+    // whatever's left - independent read-tool calls - concurrently, since
+    // Claude can fan out to several lookups in one turn with no data
+    // dependency between them (e.g. two different orders). Order is
+    // preserved via `position` regardless of which promise resolves first.
+    const resultBlocks: Anthropic.ToolResultBlockParam[] = new Array(toolUseBlocks.length);
+    const pendingExecutions: { position: number; blockId: string; tool: ToolDefinition; args: unknown }[] = [];
 
-    for (const block of toolUseBlocks) {
+    toolUseBlocks.forEach((block, position) => {
       const callKey = `${block.name}:${JSON.stringify(block.input)}`;
       log("tool:requested", { name: block.name, args: block.input });
 
       const tool = getTool(block.name);
       if (!tool) {
         log("tool:unknown", { name: block.name });
-        resultBlocks.push(toolResultBlock(block.id, `Unknown tool "${block.name}". It is not registered and cannot be called.`, true));
-        continue;
+        resultBlocks[position] = toolResultBlock(block.id, `Unknown tool "${block.name}". It is not registered and cannot be called.`, true);
+        return;
       }
 
       const validation = tool.validate(block.input);
       if (!validation.valid) {
         log("tool:validation_failed", { name: block.name, error: validation.error });
-        resultBlocks.push(toolResultBlock(block.id, `Invalid arguments: ${validation.error}`, true));
-        continue;
+        resultBlocks[position] = toolResultBlock(block.id, `Invalid arguments: ${validation.error}`, true);
+        return;
       }
 
       if (seenCalls.has(callKey)) {
         log("tool:duplicate_call_blocked", { name: block.name, args: validation.value });
-        resultBlocks.push(
-          toolResultBlock(block.id, "This exact call was already made earlier in this turn. Reuse that result instead of calling again.", true)
+        resultBlocks[position] = toolResultBlock(
+          block.id,
+          "This exact call was already made earlier in this turn. Reuse that result instead of calling again.",
+          true
         );
-        continue;
+        return;
       }
       seenCalls.add(callKey);
 
@@ -164,26 +207,29 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       if (tool.operationType === "write") {
         pendingAction = { tool: tool.name, args: validation.value, summary: describePendingAction(tool.name, validation.value) };
         log("tool:write_awaiting_confirmation", { name: block.name, args: validation.value });
-        resultBlocks.push(
-          toolResultBlock(block.id, {
-            status: "awaiting_confirmation",
-            message: "This is a write operation. Do not call it again. Call respond to ask the user to explicitly confirm - do not call any more business tools this turn.",
-          })
-        );
-        continue;
+        resultBlocks[position] = toolResultBlock(block.id, {
+          status: "awaiting_confirmation",
+          message: "This is a write operation. Do not call it again. Call respond to ask the user to explicitly confirm - do not call any more business tools this turn.",
+        });
+        return;
       }
 
-      let result: ToolResult;
-      try {
-        result = await withTimeout(tool.handler(validation.value), TOOL_TIMEOUT_MS, "Tool");
-      } catch (err) {
-        log("tool:execution_failed", { name: block.name, error: err instanceof Error ? err.message : String(err) });
-        result = { success: false, error: "The tool failed to execute. Please try again." };
-      }
+      pendingExecutions.push({ position, blockId: block.id, tool, args: validation.value });
+    });
 
-      log("tool:result", { name: block.name, success: result.success });
-      resultBlocks.push(toolResultBlock(block.id, result, !result.success));
-    }
+    await Promise.all(
+      pendingExecutions.map(async ({ position, blockId, tool, args }) => {
+        let result: ToolResult;
+        try {
+          result = await withTimeout(tool.handler(args), TOOL_TIMEOUT_MS, "Tool");
+        } catch (err) {
+          log("tool:execution_failed", { name: tool.name, error: err instanceof Error ? err.message : String(err) });
+          result = { success: false, error: "The tool failed to execute. Please try again." };
+        }
+        log("tool:result", { name: tool.name, success: result.success });
+        resultBlocks[position] = toolResultBlock(blockId, result, !result.success);
+      })
+    );
 
     messages.push({ role: "user", content: resultBlocks });
   }

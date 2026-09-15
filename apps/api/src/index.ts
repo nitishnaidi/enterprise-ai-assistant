@@ -112,12 +112,28 @@ function describeExecutedAction(name: string, args: any, data: any): string {
   return `Done: ${name} completed successfully.`;
 }
 
+// Server-Sent Events: the agent loop can take several sequential Claude
+// round-trips (RAG retrieval, tool calls, then the final answer), so instead
+// of making the caller wait for the whole turn we stream the final "respond"
+// text back as it's generated. Once this starts writing, the HTTP status is
+// already committed to 200 - failures from here on are reported as an
+// "error" SSE event, not a status code.
+function sendEvent(res: Response, event: string, data: unknown): void {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
 app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Response) => {
   const { message, history } = req.body;
 
   if (!message || typeof message !== "string") {
     return res.status(400).json({ error: "message is required" });
   }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
 
   try {
     log("chat:request", { message });
@@ -172,6 +188,7 @@ app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Respons
       model: ANTHROPIC_MODEL,
       system: SYSTEM_PROMPT,
       messages,
+      onReplyDelta: (partial) => sendEvent(res, "reply_delta", { reply: partial }),
     });
     log("chat:response", { iterations: result.iterations, hasPendingAction: Boolean(result.pendingAction) });
 
@@ -188,10 +205,12 @@ app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Respons
       log("chat:sources_filtered", { claimed: result.sources, kept: sources });
     }
 
-    res.json({ reply: result.finalText, sources, pendingAction: result.pendingAction });
+    sendEvent(res, "done", { reply: result.finalText, sources, pendingAction: result.pendingAction });
+    res.end();
   } catch (err) {
     console.error("Chat request failed:", err instanceof Error ? err.message : err);
-    res.status(502).json({ error: "Failed to get a response from Claude" });
+    sendEvent(res, "error", { error: "Failed to get a response from Claude" });
+    res.end();
   }
 });
 
