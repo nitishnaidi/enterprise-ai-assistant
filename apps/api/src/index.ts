@@ -3,10 +3,12 @@ import express, { type Request, type Response } from "express";
 import cors from "cors";
 import Anthropic from "@anthropic-ai/sdk";
 import { embeddingProvider } from "./services/embeddings.js";
-import { searchSimilarChunks } from "./services/retrieval.js";
+import { searchSimilarChunks, type RetrievedChunk } from "./services/retrieval.js";
+import { rerankTexts } from "./services/reranker.js";
 import { runAgentLoop } from "./agent/agentLoop.js";
 import { getTool, getAllTools } from "./tools/registry.js";
 import { log } from "./utils/logger.js";
+import { withTimeout } from "./utils/timeout.js";
 
 interface ChatHistoryMessage {
   role: "user" | "assistant";
@@ -21,7 +23,25 @@ interface ChatRequestBody {
 const app = express();
 const PORT = process.env.PORT || 4000;
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
-const TOP_K = 5;
+// Retrieval runs in two stages: a wide, cheap cosine-similarity search for
+// recall (CANDIDATE_K), then a rerank pass that actually reads the query
+// against each candidate for precision, cut down to FINAL_K.
+const CANDIDATE_K = 20;
+const FINAL_K = 5;
+// Cosine distance above this is "different topic", not just "not the top
+// match" - drop it before spending a rerank call on it. 0 = identical
+// direction, 2 = opposite; this is a coarse recall-stage filter, tune against
+// real query/document pairs rather than trusting the number in the abstract.
+const MAX_DISTANCE = 0.6;
+// Voyage relevance_score is 0-1. Below this, the chunk is on-topic enough to
+// have survived the distance filter but the reranker doesn't consider it an
+// actual match for the question - don't let it into the Context block.
+const MIN_RERANK_SCORE = 0.3;
+// Bounds on external calls in the request path, so a slow/hung upstream
+// (Voyage, order-service) fails fast instead of hanging the request.
+const EMBED_TIMEOUT_MS = 5000;
+const RERANK_TIMEOUT_MS = 5000;
+const CONFIRM_TOOL_TIMEOUT_MS = 8000;
 
 const SYSTEM_PROMPT = `You are an enterprise assistant. You have two distinct sources of information, and you must use the right one for each question:
 
@@ -102,12 +122,41 @@ app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Respons
   try {
     log("chat:request", { message });
 
-    const queryEmbedding = await embeddingProvider.embedQuery(message);
-    const retrievedChunks = await searchSimilarChunks(queryEmbedding, TOP_K);
+    const queryEmbedding = await withTimeout(embeddingProvider.embedQuery(message), EMBED_TIMEOUT_MS, "Embedding");
+    const candidates = await searchSimilarChunks(queryEmbedding, CANDIDATE_K);
+    const withinDistance = candidates.filter((chunk) => chunk.distance <= MAX_DISTANCE);
+    log("rag:candidates", {
+      count: candidates.length,
+      withinDistance: withinDistance.length,
+      topDistance: candidates[0]?.distance,
+    });
+
+    let retrievedChunks: RetrievedChunk[] = [];
+    if (withinDistance.length > 0) {
+      try {
+        const reranked = await withTimeout(
+          rerankTexts(
+            message,
+            withinDistance.map((chunk) => chunk.content),
+            FINAL_K
+          ),
+          RERANK_TIMEOUT_MS,
+          "Rerank"
+        );
+        retrievedChunks = reranked
+          .filter((r) => r.relevanceScore >= MIN_RERANK_SCORE)
+          .map((r) => withinDistance[r.index]);
+      } catch (err) {
+        // Reranking is a precision upgrade on top of the cosine shortlist,
+        // not a hard dependency - if Voyage is slow or down, fall back to
+        // the plain cosine ranking rather than failing the whole answer.
+        log("rag:rerank_failed", { error: err instanceof Error ? err.message : String(err) });
+        retrievedChunks = withinDistance.slice(0, FINAL_K);
+      }
+    }
     log("rag:retrieved", {
       count: retrievedChunks.length,
       topSource: retrievedChunks[0]?.documentName,
-      topDistance: retrievedChunks[0]?.distance,
     });
 
     const contextBlock = buildContextBlock(retrievedChunks);
@@ -173,7 +222,7 @@ app.post("/api/chat/confirm", async (req: Request<{}, {}, ConfirmRequestBody>, r
   log("confirm:executing", { tool: toolName, args: validation.value });
 
   try {
-    const result = await tool.handler(validation.value);
+    const result = await withTimeout(tool.handler(validation.value), CONFIRM_TOOL_TIMEOUT_MS, "Write tool");
     log("confirm:result", { tool: toolName, success: result.success });
 
     if (!result.success) {

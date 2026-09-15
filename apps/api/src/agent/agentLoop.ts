@@ -2,6 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { getTool, toAnthropicTools } from "../tools/registry.js";
 import type { ToolResult } from "../tools/types.js";
 import { log } from "../utils/logger.js";
+import { withTimeout } from "../utils/timeout.js";
 
 const MAX_ITERATIONS = 4;
 const TOOL_TIMEOUT_MS = 5000;
@@ -66,13 +67,6 @@ function toolResultBlock(toolUseId: string, content: unknown, isError = false): 
     content: typeof content === "string" ? content : JSON.stringify(content),
     is_error: isError,
   };
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`Tool timed out after ${ms}ms`)), ms)),
-  ]);
 }
 
 function describePendingAction(name: string, args: any): string {
@@ -181,7 +175,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 
       let result: ToolResult;
       try {
-        result = await withTimeout(tool.handler(validation.value), TOOL_TIMEOUT_MS);
+        result = await withTimeout(tool.handler(validation.value), TOOL_TIMEOUT_MS, "Tool");
       } catch (err) {
         log("tool:execution_failed", { name: block.name, error: err instanceof Error ? err.message : String(err) });
         result = { success: false, error: "The tool failed to execute. Please try again." };
