@@ -99,6 +99,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
   );
   const seenCalls = new Set<string>();
   let pendingAction: PendingAction | undefined;
+  // Sliding cache breakpoint over `messages`, only ever placed once we know
+  // there will be another iteration (right after growing the array, not
+  // before the first call) - a single-iteration turn (no tool calls) never
+  // pays the extra cache-write cost for a breakpoint that would never be
+  // reused. Moved forward each iteration rather than added to, so it never
+  // stacks up more than one of the four cache breakpoints Anthropic allows
+  // per request (the other two being the tools/system ones above).
+  let cachedMessageBlock: Anthropic.ToolResultBlockParam | null = null;
 
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     log("iteration:start", { iteration });
@@ -232,6 +240,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
     );
 
     messages.push({ role: "user", content: resultBlocks });
+
+    // We're definitely calling Claude again this turn, so mark the end of
+    // what we're about to send as cacheable: next iteration's prefix will be
+    // exactly this, so it's a cache hit for everything except the new blocks
+    // that iteration adds.
+    if (cachedMessageBlock) delete cachedMessageBlock.cache_control;
+    cachedMessageBlock = resultBlocks[resultBlocks.length - 1];
+    cachedMessageBlock.cache_control = { type: "ephemeral" };
   }
 
   log("iterations:max_reached", { maxIterations: MAX_ITERATIONS });
