@@ -3,7 +3,7 @@ import express, { type Request, type Response } from "express";
 import cors from "cors";
 import Anthropic from "@anthropic-ai/sdk";
 import { embeddingProvider } from "./services/embeddings.js";
-import { searchSimilarChunks, type RetrievedChunk } from "./services/retrieval.js";
+import { searchSimilarChunks, searchByKeyword, mergeCandidates, type RetrievedChunk } from "./services/retrieval.js";
 import { rerankTexts } from "./services/reranker.js";
 import { runAgentLoop } from "./agent/agentLoop.js";
 import { getTool, getAllTools } from "./tools/registry.js";
@@ -27,7 +27,13 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 // recall (CANDIDATE_K), then a rerank pass that actually reads the query
 // against each candidate for precision, cut down to FINAL_K.
 const CANDIDATE_K = 20;
+const KEYWORD_CANDIDATE_K = 10;
 const FINAL_K = 5;
+// How many of the most recent history turns to fold into the retrieval
+// query. A follow-up ("what about the second one?") can't be embedded
+// meaningfully on its own - it needs the immediately preceding exchange to
+// resolve what it's referring to.
+const RETRIEVAL_HISTORY_TURNS = 2;
 // Cosine distance above this is "different topic", not just "not the top
 // match" - drop it before spending a rerank call on it. 0 = identical
 // direction, 2 = opposite; this is a coarse recall-stage filter, tune against
@@ -41,6 +47,7 @@ const MIN_RERANK_SCORE = 0.3;
 // (Voyage, order-service) fails fast instead of hanging the request.
 const EMBED_TIMEOUT_MS = 5000;
 const RERANK_TIMEOUT_MS = 5000;
+const KEYWORD_TIMEOUT_MS = 5000;
 const CONFIRM_TOOL_TIMEOUT_MS = 8000;
 
 const SYSTEM_PROMPT = `You are an enterprise assistant. You have two distinct sources of information, and you must use the right one for each question:
@@ -96,6 +103,17 @@ function buildContextBlock(chunks: { documentName: string; chunkIndex: number; c
     .join("\n\n---\n\n");
 }
 
+// Retrieval-only: this text is never sent to Claude (which sees the real
+// conversation via `messages`), it's just what gets embedded/keyword-matched/
+// reranked, so a follow-up question resolves against recent context instead
+// of being searched for in isolation.
+function buildRetrievalQuery(message: string, history: ChatHistoryMessage[]): string {
+  if (history.length === 0) return message;
+  const recent = history.slice(-RETRIEVAL_HISTORY_TURNS);
+  const context = recent.map((turn) => `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content}`).join("\n");
+  return `${context}\nUser: ${message}`;
+}
+
 interface ConfirmRequestBody {
   tool: string;
   args: unknown;
@@ -138,22 +156,42 @@ app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Respons
   try {
     log("chat:request", { message });
 
-    const queryEmbedding = await withTimeout(embeddingProvider.embedQuery(message), EMBED_TIMEOUT_MS, "Embedding");
-    const candidates = await searchSimilarChunks(queryEmbedding, CANDIDATE_K);
-    const withinDistance = candidates.filter((chunk) => chunk.distance <= MAX_DISTANCE);
+    const historyMessages: ChatHistoryMessage[] = Array.isArray(history) ? history : [];
+    const retrievalQuery = buildRetrievalQuery(message, historyMessages);
+
+    // Embedding (Voyage) and keyword search (Postgres) have no data
+    // dependency on each other, so run them concurrently rather than paying
+    // for both round-trips in sequence.
+    const [queryEmbedding, keywordCandidates] = await Promise.all([
+      withTimeout(embeddingProvider.embedQuery(retrievalQuery), EMBED_TIMEOUT_MS, "Embedding"),
+      withTimeout(searchByKeyword(retrievalQuery, KEYWORD_CANDIDATE_K), KEYWORD_TIMEOUT_MS, "Keyword search").catch(
+        (err) => {
+          // Same philosophy as the rerank fallback below: keyword search is
+          // an extra recall signal, not a hard dependency:
+          log("rag:keyword_search_failed", { error: err instanceof Error ? err.message : String(err) });
+          return [] as RetrievedChunk[];
+        }
+      ),
+    ]);
+
+    const vectorCandidates = await searchSimilarChunks(queryEmbedding, CANDIDATE_K);
+    const withinDistance = vectorCandidates.filter((chunk) => chunk.distance <= MAX_DISTANCE);
+    const candidates = mergeCandidates(withinDistance, keywordCandidates);
     log("rag:candidates", {
-      count: candidates.length,
+      vectorCount: vectorCandidates.length,
       withinDistance: withinDistance.length,
-      topDistance: candidates[0]?.distance,
+      keywordCount: keywordCandidates.length,
+      merged: candidates.length,
+      topDistance: vectorCandidates[0]?.distance,
     });
 
     let retrievedChunks: RetrievedChunk[] = [];
-    if (withinDistance.length > 0) {
+    if (candidates.length > 0) {
       try {
         const reranked = await withTimeout(
           rerankTexts(
-            message,
-            withinDistance.map((chunk) => chunk.content),
+            retrievalQuery,
+            candidates.map((chunk) => chunk.content),
             FINAL_K
           ),
           RERANK_TIMEOUT_MS,
@@ -161,13 +199,13 @@ app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Respons
         );
         retrievedChunks = reranked
           .filter((r) => r.relevanceScore >= MIN_RERANK_SCORE)
-          .map((r) => withinDistance[r.index]);
+          .map((r) => candidates[r.index]);
       } catch (err) {
-        // Reranking is a precision upgrade on top of the cosine shortlist,
+        // Reranking is a precision upgrade on top of the merged shortlist,
         // not a hard dependency - if Voyage is slow or down, fall back to
-        // the plain cosine ranking rather than failing the whole answer.
+        // the shortlist as-is rather than failing the whole answer.
         log("rag:rerank_failed", { error: err instanceof Error ? err.message : String(err) });
-        retrievedChunks = withinDistance.slice(0, FINAL_K);
+        retrievedChunks = candidates.slice(0, FINAL_K);
       }
     }
     log("rag:retrieved", {
@@ -178,10 +216,7 @@ app.post("/api/chat", async (req: Request<{}, {}, ChatRequestBody>, res: Respons
     const contextBlock = buildContextBlock(retrievedChunks);
     const userTurn = `Context:\n\n${contextBlock}\n\nQuestion: ${message}`;
 
-    const messages: ChatHistoryMessage[] = [
-      ...(Array.isArray(history) ? history : []),
-      { role: "user", content: userTurn },
-    ];
+    const messages: ChatHistoryMessage[] = [...historyMessages, { role: "user", content: userTurn }];
 
     const result = await runAgentLoop({
       anthropic,

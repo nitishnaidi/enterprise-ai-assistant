@@ -28,21 +28,43 @@ async function main() {
 
   const embeddings = await embeddingProvider.embedDocuments(chunks.map((c) => c.text));
 
-  console.log(`Storing ${chunks.length} chunk(s) in Postgres...`);
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    await pool.query(
-      `INSERT INTO document_chunks (document_id, document_name, chunk_index, content, metadata, embedding)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
-        documentId,
-        documentName,
-        chunk.index,
-        chunk.text,
-        JSON.stringify({ tokenCount: chunk.tokenCount, ingestedAt: new Date().toISOString() }),
-        pgvector.toSql(embeddings[i]),
-      ]
-    );
+  // document_name is this pipeline's natural key for "the same document" -
+  // re-ingesting a filename that's already present replaces its old chunks
+  // instead of leaving them in the table to keep competing with the new
+  // content at retrieval time. Delete + insert run in one transaction so a
+  // failed re-ingest can't leave the document with zero chunks.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rowCount } = await client.query(`DELETE FROM document_chunks WHERE document_name = $1`, [documentName]);
+    if (rowCount) {
+      console.log(`Replacing ${rowCount} existing chunk(s) previously ingested from "${documentName}".`);
+    }
+
+    console.log(`Storing ${chunks.length} chunk(s) in Postgres...`);
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      await client.query(
+        `INSERT INTO document_chunks (document_id, document_name, chunk_index, content, metadata, embedding)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          documentId,
+          documentName,
+          chunk.index,
+          chunk.text,
+          JSON.stringify({ tokenCount: chunk.tokenCount, ingestedAt: new Date().toISOString() }),
+          pgvector.toSql(embeddings[i]),
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
 
   console.log(`Done. Ingested ${chunks.length} chunk(s) from "${documentName}" (document_id: ${documentId}).`);

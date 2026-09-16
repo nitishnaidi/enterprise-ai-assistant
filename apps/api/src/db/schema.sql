@@ -15,3 +15,9 @@ CREATE TABLE IF NOT EXISTS document_chunks (
 );
 
 CREATE INDEX IF NOT EXISTS document_chunks_document_id_idx ON document_chunks (document_id);
+
+-- Backs the keyword-search half of hybrid retrieval (see searchByKeyword in
+-- services/retrieval.ts). Existing dev databases won't pick this up until
+-- either `docker compose down -v` (see note above) or a manual
+-- `CREATE INDEX` run against the running container.
+CREATE INDEX IF NOT EXISTS document_chunks_content_fts_idx ON document_chunks USING GIN (to_tsvector('english', content));
