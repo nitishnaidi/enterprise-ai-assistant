@@ -143,6 +143,18 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 
     const response = await stream.finalMessage();
 
+    // cache_read_input_tokens > 0 is the actual proof the cache breakpoints
+    // above are paying off, not just present in the request - without this,
+    // a broken breakpoint (e.g. a prefix that silently stopped matching)
+    // would look identical to a working one from the outside.
+    log("iteration:usage", {
+      iteration,
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      cacheCreationTokens: response.usage.cache_creation_input_tokens,
+      cacheReadTokens: response.usage.cache_read_input_tokens,
+    });
+
     const toolUseBlocks = response.content.filter(isToolUseBlock);
     const respondBlock = toolUseBlocks.find((b) => b.name === RESPOND_TOOL.name);
 

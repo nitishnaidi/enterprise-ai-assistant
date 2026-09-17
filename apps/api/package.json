@@ -11,13 +11,15 @@
     "test:chunking": "tsx src/scripts/testChunking.ts",
     "test:embeddings": "tsx src/scripts/testEmbeddings.ts",
     "test:retrieval": "tsx src/scripts/testRetrieval.ts",
-    "test:tools": "tsx src/scripts/testTools.ts"
+    "test:tools": "tsx src/scripts/testTools.ts",
+    "eval": "tsx src/scripts/runEvals.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-rate-limit": "^8.7.0",
     "gpt-tokenizer": "^4.0.0",
     "pdf-parse": "^2.4.5",
     "pg": "^8.23.0",
