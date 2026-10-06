@@ -1,6 +1,8 @@
 // Verifies extraction + chunking on their own, before embeddings or the
-// database are involved at all.
-// Usage: npm run test:chunking --workspace api -- ./sample-docs/returns-policy.txt
+// database are involved at all. Only exercises the plain-text/PDF path
+// (services/textExtraction.ts), not OKF frontmatter parsing - the sample
+// docs are now .md/OKF, so point this at a .txt/.pdf file of your own.
+// Usage: npm run test:chunking --workspace api -- <path-to-pdf-or-txt>
 import { extractText } from "../services/textExtraction.js";
 import { chunkText } from "../services/chunker.js";
 

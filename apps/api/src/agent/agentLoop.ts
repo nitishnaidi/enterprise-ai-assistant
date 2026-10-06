@@ -29,7 +29,7 @@ const RESPOND_TOOL: Anthropic.Tool = {
         type: "array",
         items: { type: "string" },
         description:
-          'Every source this reply materially depends on: Context document filenames (e.g. "returns-policy.txt") you actually used, and/or tool names (e.g. "getOrder") whose results you used. Do not list a document or tool that was available but that you did not end up relying on. Use an empty array if the reply does not depend on any specific document or tool result (e.g. a greeting or a clarifying question).',
+          'Every source this reply materially depends on: Context document filenames (e.g. "returns-policy.md") you actually used, and/or tool names (e.g. "getOrder") whose results you used. Do not list a document or tool that was available but that you did not end up relying on. Use an empty array if the reply does not depend on any specific document or tool result (e.g. a greeting or a clarifying question).',
       },
     },
     required: ["reply", "sourcesUsed"],

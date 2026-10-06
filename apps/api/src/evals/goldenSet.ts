@@ -16,9 +16,10 @@ export interface EvalCase {
   mustNotContain?: string[];
 }
 
-// Grounded in sample-docs/returns-policy.txt - run `npm run ingest --
-// sample-docs/returns-policy.txt` before running evals, or these will fail
-// on missing context rather than on an actual answer-quality regression.
+// Grounded in sample-docs/returns-policy.md (an OKF concept document) - run
+// `npm run ingest --workspace api -- ./sample-docs/returns-policy.md` before
+// running evals, or these will fail on missing context rather than on an
+// actual answer-quality regression.
 // "order-not-found" additionally needs order-service reachable (see
 // ORDER_SERVICE_URL in .env) since it exercises a real tool call.
 export const GOLDEN_SET: EvalCase[] = [
@@ -26,21 +27,21 @@ export const GOLDEN_SET: EvalCase[] = [
     id: "return-window",
     message: "How many days do I have to return an item?",
     rubric: "Should state the 30-day return window from the delivery date, grounded in the returns policy.",
-    expectSourcesSubsetOf: ["returns-policy.txt"],
+    expectSourcesSubsetOf: ["returns-policy.md"],
     mustContainAny: ["30 day", "30-day", "30 days"],
   },
   {
     id: "non-returnable-item",
     message: "Can I return a gift card I bought?",
     rubric: "Should say gift cards are final sale and cannot be returned, per the policy's non-returnable items list.",
-    expectSourcesSubsetOf: ["returns-policy.txt"],
+    expectSourcesSubsetOf: ["returns-policy.md"],
   },
   {
     id: "conditional-shipping-refund",
     message: "Can I get a refund for the shipping cost on a return?",
     rubric:
       "Shipping fees are non-refundable UNLESS the return is due to a defect or a shipping error on the company's part. A correct answer states this conditional rather than a flat yes or no.",
-    expectSourcesSubsetOf: ["returns-policy.txt"],
+    expectSourcesSubsetOf: ["returns-policy.md"],
   },
   {
     id: "out-of-scope-price-match",
@@ -48,6 +49,14 @@ export const GOLDEN_SET: EvalCase[] = [
     rubric:
       "The returns policy says nothing about price matching. A correct answer says it doesn't have enough information rather than guessing or inventing a policy.",
     expectSourcesEmpty: true,
+  },
+  {
+    id: "out-of-scope-general-knowledge",
+    message: "What is 2 x 2?",
+    rubric:
+      "This has nothing to do with customer support, orders, or policy. A correct answer declines to answer it (even though it's trivially easy) and redirects the user to what the assistant can actually help with, rather than just answering '4'.",
+    expectSourcesEmpty: true,
+    expectNoPendingAction: true,
   },
   {
     id: "missing-order-id",
@@ -78,6 +87,6 @@ export const GOLDEN_SET: EvalCase[] = [
     ],
     rubric:
       "This is a follow-up to a question about the return window. A correct answer addresses international orders specifically (same 30-day window, but the customer pays return shipping and any customs fees) rather than repeating the generic domestic answer or failing to connect 'what about' to the prior topic.",
-    expectSourcesSubsetOf: ["returns-policy.txt"],
+    expectSourcesSubsetOf: ["returns-policy.md"],
   },
 ];
